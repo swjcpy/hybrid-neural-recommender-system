@@ -11,8 +11,9 @@ import numpy as np
 from keras import initializers
 from keras.regularizers import l2
 from keras.models import Model
-from keras.layers import Embedding, Input, Dense, merge, Flatten, concatenate, multiply, Reshape
+from keras.layers import Embedding, Input, Dense, merge, Flatten, concatenate, multiply, Reshape, GlobalMaxPooling1D, GlobalAveragePooling1D
 from keras.optimizers import Adagrad, Adam, SGD, RMSprop
+import keras.callbacks
 from evaluate import evaluate_model
 from Dataset import Dataset
 from time import time
@@ -20,11 +21,25 @@ import GMF
 import MLP
 import argparse
 import pdb
+from scipy import sparse
 
+class NBatchLogger(keras.callbacks.Callback):
+    def __init__(self,display=100):
+        '''
+        display: Number of batches to wait before outputting loss
+        '''
+        self.seen = 0
+        self.display = display
+
+    def on_batch_end(self,batch,logs={}):
+        self.seen += logs.get('size', 0)
+        if self.seen % self.display == 0:
+            print('\n{0}/{1} - Batch Loss: {2}'.format(self.seen,self.params['nb_sample'],
+                                                self.params['metrics'][0]))
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run NeuMF.")
-    parser.add_argument('--path', nargs='?', default='ml-1m/',
+    parser.add_argument('--path', nargs='?', default='Data/',
                         help='Input data path.')
     parser.add_argument('--dataset', nargs='?', default='ml-1m',
                         help='Choose a dataset.')
@@ -32,7 +47,7 @@ def parse_args():
                         help='Number of epochs.')
     parser.add_argument('--batch_size', type=int, default=256,
                         help='Batch size.')
-    parser.add_argument('--num_factors', type=int, default=8,
+    parser.add_argument('--num_factors', type=int, default=50,
                         help='Embedding size of MF model.')
     parser.add_argument('--layers', nargs='?', default='[64,32,16,8]',
                         help="MLP layers. Note that the first layer is the concatenation "
@@ -57,8 +72,11 @@ def parse_args():
                         help='Specify the pretrain model file for MLP part. If empty, no pretrain will be used')
     return parser.parse_args()
 
+max_length = 1292
+user_dict_size = 106065
+movie_dict_size = 29608
 
-def get_model(num_users, num_items, mf_dim=10, layers=[10], reg_layers=[0], reg_mf=0):
+def get_model(num_users, num_items, mf_dim=50, layers=[50], reg_layers=[0], reg_mf=0):
     assert len(layers) == len(reg_layers)
     num_layer = len(layers) #Number of layers in the MLP
     # Input variables
@@ -66,51 +84,45 @@ def get_model(num_users, num_items, mf_dim=10, layers=[10], reg_layers=[0], reg_
     item_input = Input(shape=(1,), dtype='int32', name='item_input')
 
     # User & Item feature
-    user_feature = Input(shape=(4,), dtype='float32', name='user_feature')
-    # user_input = concatenate([user_input, user_feature])
-    # user_feature_reshape = Reshape((1, 4), name="user_reshaping")(user_feature)
-    item_feature = Input(shape=(4,), dtype='float32', name='item_feature')
-    item_feature_reshape = Reshape((1, 4), name="item_reshaping")(item_feature)
+    user_feature = Input(shape=(4,), dtype='int32', name='user_feature')
+    user_all_feature = concatenate([user_input, user_feature])
+    item_feature = Input(shape=(max_length,), dtype='int32', name='item_feature')
+    # item_feature_reshape = Reshape((1, max_length))(item_feature)
+    
     
     # Embedding layer
-    MF_Embedding_User = Embedding(input_dim=num_users, output_dim=mf_dim, name='mf_embedding_user',
+    MF_Embedding_User = Embedding(input_dim=user_dict_size, output_dim=int(mf_dim/5), name='mf_embedding_user',
                                   embeddings_initializer=initializers.random_normal(),
                                   embeddings_regularizer=l2(reg_mf),
-                                  input_length=1)
-    MF_Embedding_Item = Embedding(input_dim=num_items, output_dim=mf_dim, name='mf_embedding_item',
+                                  input_length=5)
+    MF_Embedding_Item = Embedding(input_dim=movie_dict_size, output_dim=int(mf_dim), name='mf_embedding_item',
                                   embeddings_initializer=initializers.random_normal(),
-                                  embeddings_regularizer=l2(reg_mf), input_length=1)
+                                  embeddings_regularizer=l2(reg_mf), input_length=max_length)
 
-    MLP_Embedding_User = Embedding(input_dim=num_users, output_dim=int(layers[0]/2), name="mlp_embedding_user",
+    MLP_Embedding_User = Embedding(input_dim=user_dict_size, output_dim=int(layers[0]/10), name="mlp_embedding_user",
                                    embeddings_initializer=initializers.random_normal(),
-                                   embeddings_regularizer=l2(reg_layers[0]), input_length=1)
-    MLP_Embedding_Item = Embedding(input_dim=num_items, output_dim=int(layers[0]/2), name='mlp_embedding_item',
+                                   embeddings_regularizer=l2(reg_layers[0]), input_length=5)
+    MLP_Embedding_Item = Embedding(input_dim=movie_dict_size, output_dim=int(layers[0]/2), name='mlp_embedding_item',
                                    embeddings_initializer=initializers.random_normal(),
-                                   embeddings_regularizer=l2(reg_layers[0]), input_length=1)
+                                   embeddings_regularizer=l2(reg_layers[0]), input_length=max_length)
     
     # MF part
-    # mf_user_latent = Flatten()(concatenate([MF_Embedding_User(user_input), user_feature_reshape]))
-    mf_user_latent = Flatten()(MF_Embedding_User(user_input))
-    # mf_item_latent = Flatten()(concatenate([MF_Embedding_Item(item_input), item_feature_reshape]))
-    mf_item_latent = Flatten()(MF_Embedding_Item(item_input))
-    # mf_vector = merge([mf_user_latent, mf_item_latent], mode = 'mul') # element-wise multiply
+    # mf_user_latent = Flatten()(MF_Embedding_User(user_feature))
+    # mf_item_latent = Flatten()(MF_Embedding_Item(item_input))
+    mf_user_latent = Flatten()(MF_Embedding_User(user_all_feature))
+    mf_item_latent = GlobalAveragePooling1D(data_format='channels_last')(MF_Embedding_Item(item_feature))
     mf_vector = multiply([mf_user_latent, mf_item_latent])
 
     # MLP part 
-    # mlp_user_latent = Flatten()(concatenate([MF_Embedding_User(user_input), user_feature_reshape]))
-    # mlp_item_latent = Flatten()(concatenate([MF_Embedding_Item(item_input), item_feature_reshape]))
-    # mlp_vector = merge([mlp_user_latent, mlp_item_latent], mode = 'concat')
-    mlp_user_latent = Flatten()(MF_Embedding_User(user_input))
-    mlp_item_latent = Flatten()(MF_Embedding_Item(item_input))
+    mlp_user_latent = Flatten()(MLP_Embedding_User(user_all_feature))
+    mlp_item_latent = GlobalAveragePooling1D(data_format='channels_last')(MLP_Embedding_Item(item_feature))
     mlp_vector = concatenate([mlp_user_latent, mlp_item_latent])
+
     for idx in range(1, num_layer):
         layer = Dense(layers[idx], kernel_regularizer=l2(reg_layers[idx]), activation='relu', name="layer%d" % idx)
         mlp_vector = layer(mlp_vector)
 
     # Concatenate MF and MLP parts
-    #mf_vector = Lambda(lambda x: x * alpha)(mf_vector)
-    #mlp_vector = Lambda(lambda x : x * (1-alpha))(mlp_vector)
-    # predict_vector = merge([mf_vector, mlp_vector], mode = 'concat')
     predict_vector = concatenate([mf_vector, mlp_vector])
     
     # Final prediction layer
@@ -150,7 +162,7 @@ def load_pretrain_model(model, gmf_model, mlp_model, num_layers):
     return model
 
 
-def get_train_instances(train, num_negatives, userFeature):
+def get_train_instances(train, num_negatives, userFeature, movieFeature, movieidx):
     user_input, item_input, labels, user_feature, movie_feature = [], [], [], [], []
     num_users = train.shape[0]
     for (u, i) in train.keys():
@@ -159,18 +171,27 @@ def get_train_instances(train, num_negatives, userFeature):
         item_input.append(i)
         labels.append(1)
         user_feature.append(userFeature[u-1])
-        movie_feature.append([1, 1, 1, 1])
+        movie_feature.append(movieFeature[i])
         # negative instances
         for t in range(num_negatives):
             j = np.random.randint(num_items)
-            while (u, j) in train.keys():
+            while (u, j) in train.keys() or j not in movieidx:
                 j = np.random.randint(num_items)
             user_input.append(u)
             item_input.append(j)
             labels.append(0)
             user_feature.append(userFeature[u-1])
-            movie_feature.append([1, 1, 1, 1])
+            movie_feature.append(movieFeature[j])
     return user_input, item_input, labels, user_feature, movie_feature
+
+def get_movie_idx():
+    movieidx = []
+    with open(args.path + "ml-1m.movies") as f:
+        lines = f.readlines()
+        for line in lines:
+            movieidx.append(int(line.strip().split(" ")[0]))
+
+    return movieidx
 
 
 if __name__ == '__main__':
@@ -196,7 +217,8 @@ if __name__ == '__main__':
     # Loading data
     t1 = time()
     dataset = Dataset(args.path + args.dataset)
-    train, testRatings, testNegatives, userFeature = dataset.trainMatrix, dataset.testRatings, dataset.testNegatives, dataset.trainFeature
+    train, testRatings, testNegatives, userFeature, movieFeature = \
+        dataset.trainMatrix, dataset.testRatings, dataset.testNegatives, dataset.userFeature, dataset.itemFeature
     num_users, num_items = train.shape
     print("Load data done [%.1f s]. #user=%d, #item=%d, #train=%d, #test=%d" 
           %(time()-t1, num_users, num_items, train.nnz, len(testRatings)))
@@ -222,28 +244,30 @@ if __name__ == '__main__':
         print("Load pretrained GMF (%s) and MLP (%s) models done. " % (mf_pretrain, mlp_pretrain))
         
     # Init performance
-    (hits, ndcgs) = evaluate_model(model, testRatings, testNegatives, userFeature, topK, evaluation_threads)
+    (hits, ndcgs) = evaluate_model(model, testRatings, testNegatives, userFeature, movieFeature, topK, evaluation_threads)
     hr, ndcg = np.array(hits).mean(), np.array(ndcgs).mean()
     print('Init: HR = %.4f, NDCG = %.4f' % (hr, ndcg))
     best_hr, best_ndcg, best_iter = hr, ndcg, -1
     if args.out > 0:
         model.save_weights(model_out_file, overwrite=True) 
-        
+    
+    movieidx = get_movie_idx()
+
     # Training model
     for epoch in range(num_epochs):
         t1 = time()
         # Generate training instances
-        user_input, item_input, labels, user_feature, movie_feature = get_train_instances(train, num_negatives, userFeature)
+        user_input, item_input, labels, user_feature, movie_feature = get_train_instances(train, num_negatives, userFeature, movieFeature, movieidx)
         # Training
-        hist = model.fit([np.array(user_input), np.array(item_input), 
+        hist = model.fit([np.array(user_input), np.array(item_input),
                         np.array(user_feature), np.array(movie_feature)],  # input
                          np.array(labels),  # labels
-                         batch_size=batch_size, epochs=1, verbose=0, shuffle=True)
+                         batch_size=batch_size, epochs=1, verbose=1, shuffle=True)
         t2 = time()
         
         # Evaluation
         if epoch % verbose == 0:
-            (hits, ndcgs) = evaluate_model(model, testRatings, testNegatives, userFeature, topK, evaluation_threads)
+            (hits, ndcgs) = evaluate_model(model, testRatings, testNegatives, userFeature, movieFeature, topK, evaluation_threads)
             hr, ndcg, loss = np.array(hits).mean(), np.array(ndcgs).mean(), hist.history['loss'][0]
             print('Iteration %d [%.1f s]: HR = %.4f, NDCG = %.4f, loss = %.4f [%.1f s]' 
                   % (epoch,  t2-t1, hr, ndcg, loss, time()-t2))
