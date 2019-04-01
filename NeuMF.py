@@ -1,12 +1,15 @@
 '''
 Created on Aug 9, 2016
 Keras Implementation of Neural Matrix Factorization (NeuMF) recommender model in:
-He Xiangnan et al. Neural Collaborative Filtering. In WWW 2017.  
+He Xiangnan et al. Neural Collaborative Filtering. In WWW 2017.
 
 @author: Xiangnan He (xiangnanhe@gmail.com)
 '''
 import numpy as np
-
+from numpy.random import seed
+from tensorflow import set_random_seed
+seed(1)
+set_random_seed(1)
 
 from keras import initializers
 from keras.regularizers import l2
@@ -22,6 +25,7 @@ import MLP
 import argparse
 import pdb
 from scipy import sparse
+from generator import Generator
 
 class NBatchLogger(keras.callbacks.Callback):
     def __init__(self,display=100):
@@ -36,24 +40,24 @@ class NBatchLogger(keras.callbacks.Callback):
         if self.seen % self.display == 0:
             print('\n{0}/{1} - Batch Loss: {2}'.format(self.seen,self.params['nb_sample'],
                                                 self.params['metrics'][0]))
-
+#256 50 0.001: 6204 3294,
 def parse_args():
     parser = argparse.ArgumentParser(description="Run NeuMF.")
     parser.add_argument('--path', nargs='?', default='Data/',
                         help='Input data path.')
     parser.add_argument('--dataset', nargs='?', default='ml-1m',
                         help='Choose a dataset.')
-    parser.add_argument('--epochs', type=int, default=100,
+    parser.add_argument('--epochs', type=int, default=30,
                         help='Number of epochs.')
     parser.add_argument('--batch_size', type=int, default=256,
                         help='Batch size.')
-    parser.add_argument('--num_factors', type=int, default=50,
+    parser.add_argument('--num_factors', type=int, default=50, #50
                         help='Embedding size of MF model.')
     parser.add_argument('--layers', nargs='?', default='[64,32,16,8]',
                         help="MLP layers. Note that the first layer is the concatenation "
                              "of user and item embeddings. So layers[0]/2 is the embedding size.")
     parser.add_argument('--reg_mf', type=float, default=0,
-                        help='Regularization for MF embeddings.')                    
+                        help='Regularization for MF embeddings.')
     parser.add_argument('--reg_layers', nargs='?', default='[0,0,0,0]',
                         help="Regularization for each MLP layer. reg_layers[0] is the regularization for embeddings.")
     parser.add_argument('--num_neg', type=int, default=4,
@@ -72,7 +76,7 @@ def parse_args():
                         help='Specify the pretrain model file for MLP part. If empty, no pretrain will be used')
     return parser.parse_args()
 
-max_length = 1292
+max_length = 17
 user_dict_size = 106065
 movie_dict_size = 29608
 
@@ -88,8 +92,8 @@ def get_model(num_users, num_items, mf_dim=50, layers=[50], reg_layers=[0], reg_
     user_all_feature = concatenate([user_input, user_feature])
     item_feature = Input(shape=(max_length,), dtype='int32', name='item_feature')
     # item_feature_reshape = Reshape((1, max_length))(item_feature)
-    
-    
+
+
     # Embedding layer
     MF_Embedding_User = Embedding(input_dim=user_dict_size, output_dim=int(mf_dim/5), name='mf_embedding_user',
                                   embeddings_initializer=initializers.random_normal(),
@@ -105,7 +109,7 @@ def get_model(num_users, num_items, mf_dim=50, layers=[50], reg_layers=[0], reg_
     MLP_Embedding_Item = Embedding(input_dim=movie_dict_size, output_dim=int(layers[0]/2), name='mlp_embedding_item',
                                    embeddings_initializer=initializers.random_normal(),
                                    embeddings_regularizer=l2(reg_layers[0]), input_length=max_length)
-    
+
     # MF part
     # mf_user_latent = Flatten()(MF_Embedding_User(user_feature))
     # mf_item_latent = Flatten()(MF_Embedding_Item(item_input))
@@ -113,7 +117,7 @@ def get_model(num_users, num_items, mf_dim=50, layers=[50], reg_layers=[0], reg_
     mf_item_latent = GlobalAveragePooling1D(data_format='channels_last')(MF_Embedding_Item(item_feature))
     mf_vector = multiply([mf_user_latent, mf_item_latent])
 
-    # MLP part 
+    # MLP part
     mlp_user_latent = Flatten()(MLP_Embedding_User(user_all_feature))
     mlp_item_latent = GlobalAveragePooling1D(data_format='channels_last')(MLP_Embedding_Item(item_feature))
     mlp_vector = concatenate([mlp_user_latent, mlp_item_latent])
@@ -124,14 +128,14 @@ def get_model(num_users, num_items, mf_dim=50, layers=[50], reg_layers=[0], reg_
 
     # Concatenate MF and MLP parts
     predict_vector = concatenate([mf_vector, mlp_vector])
-    
+
     # Final prediction layer
     prediction = Dense(1, activation='sigmoid', kernel_initializer=initializers.lecun_normal(),
                        name="prediction")(predict_vector)
-    
+
     model_ = Model(inputs=[user_input, item_input, user_feature, item_feature],
                    outputs=prediction)
-    
+
     return model_
 
 
@@ -141,24 +145,24 @@ def load_pretrain_model(model, gmf_model, mlp_model, num_layers):
     gmf_item_embeddings = gmf_model.get_layer('item_embedding').get_weights()
     model.get_layer('mf_embedding_user').set_weights(gmf_user_embeddings)
     model.get_layer('mf_embedding_item').set_weights(gmf_item_embeddings)
-    
+
     # MLP embeddings
     mlp_user_embeddings = mlp_model.get_layer('user_embedding').get_weights()
     mlp_item_embeddings = mlp_model.get_layer('item_embedding').get_weights()
     model.get_layer('mlp_embedding_user').set_weights(mlp_user_embeddings)
     model.get_layer('mlp_embedding_item').set_weights(mlp_item_embeddings)
-    
+
     # MLP layers
     for i in range(1, num_layers):
         mlp_layer_weights = mlp_model.get_layer('layer%d' % i).get_weights()
         model.get_layer('layer%d' % i).set_weights(mlp_layer_weights)
-        
+
     # Prediction weights
     gmf_prediction = gmf_model.get_layer('prediction').get_weights()
     mlp_prediction = mlp_model.get_layer('prediction').get_weights()
     new_weights = np.concatenate((gmf_prediction[0], mlp_prediction[0]), axis=0)
     new_b = gmf_prediction[1] + mlp_prediction[1]
-    model.get_layer('prediction').set_weights([0.5*new_weights, 0.5*new_b])    
+    model.get_layer('prediction').set_weights([0.5*new_weights, 0.5*new_b])
     return model
 
 
@@ -208,7 +212,7 @@ if __name__ == '__main__':
     verbose = args.verbose
     mf_pretrain = args.mf_pretrain
     mlp_pretrain = args.mlp_pretrain
-            
+
     topK = 10
     evaluation_threads = 1  # mp.cpu_count()
     print("NeuMF arguments: %s " % args)
@@ -220,12 +224,12 @@ if __name__ == '__main__':
     train, testRatings, testNegatives, userFeature, movieFeature = \
         dataset.trainMatrix, dataset.testRatings, dataset.testNegatives, dataset.userFeature, dataset.itemFeature
     num_users, num_items = train.shape
-    print("Load data done [%.1f s]. #user=%d, #item=%d, #train=%d, #test=%d" 
+    print("Load data done [%.1f s]. #user=%d, #item=%d, #train=%d, #test=%d"
           %(time()-t1, num_users, num_items, train.nnz, len(testRatings)))
-    
+
     # Build model
     model = get_model(num_users, num_items, mf_dim, layers, reg_layers, reg_mf)
-    if learner.lower() == "adagrad": 
+    if learner.lower() == "adagrad":
         model.compile(optimizer=Adagrad(lr=learning_rate), loss='binary_crossentropy')
     elif learner.lower() == "rmsprop":
         model.compile(optimizer=RMSprop(lr=learning_rate), loss='binary_crossentropy')
@@ -233,7 +237,7 @@ if __name__ == '__main__':
         model.compile(optimizer=Adam(lr=learning_rate), loss='binary_crossentropy')
     else:
         model.compile(optimizer=SGD(lr=learning_rate), loss='binary_crossentropy')
-    
+
     # Load pretrain model
     if mf_pretrain != '' and mlp_pretrain != '':
         gmf_model = GMF.get_model(num_users, num_items, mf_dim)
@@ -242,15 +246,15 @@ if __name__ == '__main__':
         mlp_model.load_weights(mlp_pretrain)
         model = load_pretrain_model(model, gmf_model, mlp_model, len(layers))
         print("Load pretrained GMF (%s) and MLP (%s) models done. " % (mf_pretrain, mlp_pretrain))
-        
+
     # Init performance
     (hits, ndcgs) = evaluate_model(model, testRatings, testNegatives, userFeature, movieFeature, topK, evaluation_threads)
     hr, ndcg = np.array(hits).mean(), np.array(ndcgs).mean()
     print('Init: HR = %.4f, NDCG = %.4f' % (hr, ndcg))
     best_hr, best_ndcg, best_iter = hr, ndcg, -1
     if args.out > 0:
-        model.save_weights(model_out_file, overwrite=True) 
-    
+        model.save_weights(model_out_file, overwrite=True)
+
     movieidx = get_movie_idx()
 
     # Training model
@@ -259,17 +263,21 @@ if __name__ == '__main__':
         # Generate training instances
         user_input, item_input, labels, user_feature, movie_feature = get_train_instances(train, num_negatives, userFeature, movieFeature, movieidx)
         # Training
-        hist = model.fit([np.array(user_input), np.array(item_input),
-                        np.array(user_feature), np.array(movie_feature)],  # input
-                         np.array(labels),  # labels
-                         batch_size=batch_size, epochs=1, verbose=1, shuffle=True)
+        # hist = model.fit([np.array(user_input), np.array(item_input),
+        #                 np.array(user_feature), np.array(movie_feature)],  # input
+        #                  np.array(labels),  # labels
+        #                  batch_size=batch_size, epochs=1, verbose=1, shuffle=True)
+        train_generator = Generator(user_input, item_input, user_feature, movie_feature, labels, batch_size)
+        hist = model.fit_generator(generator=train_generator,
+                                   steps_per_epoch=int(np.ceil(len(user_input))//batch_size),
+                                   epochs = 1, verbose=1)
         t2 = time()
-        
+
         # Evaluation
         if epoch % verbose == 0:
             (hits, ndcgs) = evaluate_model(model, testRatings, testNegatives, userFeature, movieFeature, topK, evaluation_threads)
             hr, ndcg, loss = np.array(hits).mean(), np.array(ndcgs).mean(), hist.history['loss'][0]
-            print('Iteration %d [%.1f s]: HR = %.4f, NDCG = %.4f, loss = %.4f [%.1f s]' 
+            print('Iteration %d [%.1f s]: HR = %.4f, NDCG = %.4f, loss = %.4f [%.1f s]'
                   % (epoch,  t2-t1, hr, ndcg, loss, time()-t2))
             if hr > best_hr:
                 best_hr, best_ndcg, best_iter = hr, ndcg, epoch
